@@ -280,17 +280,15 @@ function Convert-ToWindowsPath {
         [string]$MountedPath,
         [string]$VolumeRoot
     )
-    
-    # Convert mounted drive letter to original C: drive path
-    # E.g., "E:\Users\Admin\file.txt" -> "C:\Users\Admin\file.txt"
-    
+
+    # Return the path under the actual mounted drive letter.
+    # VolumeRoot is the letter Veeam assigned (e.g. "E:\"); strip it then
+    # re-prefix with that same letter so console and JSON both report E:\...
+    # rather than the previously hard-coded C:\.
     $relativePath = $MountedPath -replace [regex]::Escape($VolumeRoot), ''
     $relativePath = $relativePath.TrimStart('\')
-    
-    # Assumes original was C: drive (for testing in lab but not common in prod)
-    # Currently as is will show correct path but regardless of drive letter will show C:\..
-    # The logs from the scan should show the letter but this is something I'l have fixed asap
-    return "C:\$relativePath"
+    $driveLetter  = $VolumeRoot.Substring(0, 2)   # e.g. "E:"
+    return "$driveLetter\$relativePath"
 }
 
 function Export-ScanResults {
