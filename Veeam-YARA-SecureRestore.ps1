@@ -1,10 +1,19 @@
-#Requires -Version 7.0
+﻿#Requires -Version 5.1
 # Veeam-YARA-SecureRestore.ps1
 # Native Windows YARA scanner for Veeam Secure Restore
 # Extracts matched onion link strings with full file path details
 #
-# Requires PowerShell 7.0+ (Veeam v13 ships PS7 on Windows).
-# Uses Start-ThreadJob (in-process, lower overhead than Start-Job).
+# Dual-version support:
+#   * Primary target  : Windows PowerShell 5.1 (native Windows / Veeam v12 host).
+#   * Accelerated path : PowerShell 7 (or 5.1 + ThreadJob module) for parallel
+#                        per-volume scanning.
+# The script runs correctly on either version; PS7-only features are detected
+# at runtime and used only when available, never required. No PS7-only *syntax*
+# is used in the script body, so it parses cleanly under Windows PowerShell 5.1.
+#
+# NOTE: save this file as UTF-8 *with BOM* — Windows PowerShell 5.1 reads
+# BOM-less files as the system ANSI codepage, which corrupts the box-drawing /
+# emoji characters used in log output.
 
 param(
     [Parameter(Mandatory=$false)]
@@ -46,6 +55,28 @@ param(
     [int]$VeeamOnePort = 1239
 )
 
+# ── Runtime capability probe ────────────────────────────────────────────────
+# Decide once which parallelism primitive is available, then cache the result.
+# This is the heart of the "PS5.1-primary, PS7-accelerated" design: nothing is
+# required, everything is detected.
+$script:PSMajor      = $PSVersionTable.PSVersion.Major
+$script:HasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+if (-not $script:HasThreadJob -and (Get-Module -ListAvailable -Name ThreadJob)) {
+    # PS5.1 can opt in to in-process thread jobs if the ThreadJob module is installed.
+    Import-Module ThreadJob -ErrorAction SilentlyContinue
+    $script:HasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+}
+$script:HasStartJob  = [bool](Get-Command Start-Job -ErrorAction SilentlyContinue)
+$script:ParallelMode =
+    if     ($script:HasThreadJob) { 'ThreadJob' }   # in-process, shared bag, -ThrottleLimit
+    elseif ($script:HasStartJob)  { 'Job' }         # out-of-process, manual throttle + collect
+    else                          { 'Sequential' }  # last-resort single-threaded
+
+# Named mutex serialises log-file writes across in-process runspaces AND
+# out-of-process Start-Job children. A named mutex must be re-opened by name in
+# each runspace (the object cannot cross a process boundary), so it is opened
+# lazily inside Write-Log rather than passed around. See Write-Log below.
+
 # Initialize logging
 New-Item -ItemType Directory -Path $LogPath -Force | Out-Null
 
@@ -53,9 +84,6 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $jobId = if ($SessionId) { $SessionId } else { "Manual_$timestamp" }
 $logFile = Join-Path $LogPath "scan_${jobId}_${timestamp}.log"
 $jsonReport = Join-Path $LogPath "results_${jobId}_${timestamp}.json"
-
-# Mutex guards the log file when parallel thread jobs write concurrently (PR-D).
-$script:LogMutex = [System.Threading.Mutex]::new($false, "VeeamYARAScanLog")
 
 function Write-Log {
     param(
@@ -67,11 +95,23 @@ function Write-Log {
     $logEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
     Write-Host $logEntry
 
-    $null = $script:LogMutex.WaitOne(5000)
+    # Lazily open the named mutex in whatever runspace/process Write-Log runs in.
+    # Opening by name (not passing the object) is the only approach that works
+    # uniformly for direct calls, in-process ThreadJob runspaces, and
+    # out-of-process Start-Job children.
+    if (-not $script:LogMutex) {
+        $script:LogMutex = [System.Threading.Mutex]::new($false, "VeeamYARAScanLog")
+    }
+    $acquired = $false
     try {
+        $acquired = $script:LogMutex.WaitOne(5000)
         [System.IO.File]::AppendAllText($logFile, "$logEntry`n")
+    } catch {
+        # As a last resort, fall back to a non-locked append so logging never
+        # throws and aborts a scan.
+        try { [System.IO.File]::AppendAllText($logFile, "$logEntry`n") } catch {}
     } finally {
-        $script:LogMutex.ReleaseMutex()
+        if ($acquired) { $script:LogMutex.ReleaseMutex() }
     }
 
     <#
@@ -215,6 +255,66 @@ function Get-ScanTargets {
     return $scanPaths
 }
 
+function Invoke-ProcessWithTimeout {
+    <#
+    .SYNOPSIS
+    Runs an external executable with a hard timeout, returning its combined
+    stdout/stderr lines. Version-neutral: uses System.Diagnostics.Process, which
+    behaves identically on Windows PowerShell 5.1 and PowerShell 7, with no
+    dependency on Start-Job / Start-ThreadJob.
+    .OUTPUTS
+    [pscustomobject] @{ TimedOut = [bool]; Output = [string[]] }
+    #>
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName               = $FilePath
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+
+    # Drain stdout/stderr asynchronously so a large match list can't deadlock the
+    # pipe buffer while we wait on the process.
+    $sb = [System.Text.StringBuilder]::new()
+    $outHandler = {
+        if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+    }
+    $outSub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action $outHandler -MessageData $sb
+    $errSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -Action $outHandler -MessageData $sb
+
+    $timedOut = $false
+    try {
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            $timedOut = $true
+            try { $proc.Kill() } catch {}
+            try { [void]$proc.WaitForExit(5000) } catch {}
+        } else {
+            # Ensure async buffers are fully flushed after a normal exit.
+            try { $proc.WaitForExit() } catch {}
+        }
+    } finally {
+        Unregister-Event -SourceIdentifier $outSub.Name -ErrorAction SilentlyContinue
+        Unregister-Event -SourceIdentifier $errSub.Name -ErrorAction SilentlyContinue
+        $proc.Dispose()
+    }
+
+    $lines = $sb.ToString() -split "`r?`n" | Where-Object { $_ -ne '' }
+    return [pscustomobject]@{ TimedOut = $timedOut; Output = $lines }
+}
+
 function Invoke-YARAScan {
     param(
         [string[]]$ScanPaths,
@@ -253,31 +353,19 @@ function Invoke-YARAScan {
             )
             
             try {
-                # Execute YARA with timeout.
-                # Start-ThreadJob (PS7 in-process) is significantly faster than
-                # Start-Job (out-of-process) for short-lived per-rule invocations.
-                $job = Start-ThreadJob -ScriptBlock {
-                    param($exe, $args)
-                    & $exe @args 2>&1
-                } -ArgumentList $YaraPath, $yaraArgs
-                
-                $completed = Wait-Job $job -Timeout $ScanTimeout
-                
-                if ($completed) {
-                    $output = Receive-Job $job
-                    Remove-Job $job -Force
-                    
-                    if ($output) {
-                        # Parse YARA output
-                        $findings = Parse-YARAOutput -Output $output -VolumeRoot $VolumeRoot -VMName $VMName
-                        $allFindings += $findings
-                    }
-                } else {
-                    Write-Log "WARNING: Scan timed out for $scanPath" -Level "WARNING"
-                    Stop-Job $job
-                    Remove-Job $job -Force
+                # Execute YARA with a hard timeout via a plain external process.
+                # This is version-neutral (no Start-Job / Start-ThreadJob), so it
+                # runs identically on Windows PowerShell 5.1 and PowerShell 7.
+                $result = Invoke-ProcessWithTimeout -FilePath $YaraPath `
+                            -Arguments $yaraArgs -TimeoutSeconds $ScanTimeout
+
+                if ($result.TimedOut) {
+                    Write-Log "WARNING: Scan timed out for $scanPath (rule: $($ruleFile.Name))" -Level "WARNING"
+                } elseif ($result.Output) {
+                    # Parse YARA output
+                    $findings = Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName
+                    $allFindings += $findings
                 }
-                
             } catch {
                 Write-Log "ERROR scanning $scanPath : $_" -Level "ERROR"
             }
@@ -417,6 +505,116 @@ function Export-ScanResults {
     return $groupedResults
 }
 
+function Invoke-VolumeScans {
+    <#
+    .SYNOPSIS
+    Scans every mounted volume and returns the aggregated findings, using the
+    best parallelism primitive available on the current PowerShell host.
+
+    Tiers (chosen once at startup in $script:ParallelMode):
+      ThreadJob   - in-process thread jobs, throttled via -ThrottleLimit (PS7,
+                    or PS5.1 with the ThreadJob module).
+      Job         - out-of-process Start-Job with manual batching/throttle
+                    (plain Windows PowerShell 5.1).
+      Sequential  - single-threaded fallback (no job infrastructure at all).
+
+    All tiers run the SAME worker scriptblock and collect findings from the
+    worker's output stream, so behaviour is identical across versions. The
+    worker uses -ArgumentList only (no $using:, no -Parallel), so nothing here
+    is PS7-only syntax.
+    #>
+    param(
+        [object[]]$Volumes,
+        [int]$Throttle
+    )
+
+    # Serialise the functions each worker runspace must rebuild from scratch.
+    $fnTable = @{
+        'Write-Log'                 = ${function:Write-Log}.ToString()
+        'Invoke-ProcessWithTimeout' = ${function:Invoke-ProcessWithTimeout}.ToString()
+        'Invoke-YARAScan'           = ${function:Invoke-YARAScan}.ToString()
+        'Parse-YARAOutput'          = ${function:Parse-YARAOutput}.ToString()
+        'Get-ScanTargets'           = ${function:Get-ScanTargets}.ToString()
+        'Convert-ToWindowsPath'     = ${function:Convert-ToWindowsPath}.ToString()
+    }
+
+    # Worker: rebuild functions in this runspace, scan one volume, EMIT findings.
+    # Identical for every tier. Script-scope settings arrive as parameters; the
+    # rebuilt functions read them via normal scope lookup. The named log mutex is
+    # re-opened lazily inside Write-Log, so nothing stateful is passed in.
+    $worker = {
+        param($volume, $fns, $YaraPath, $YaraRulesPath, $ScanTimeout, $QuickScan, $logFile)
+        foreach ($k in $fns.Keys) {
+            Set-Item -Path "function:$k" -Value ([ScriptBlock]::Create($fns[$k]))
+        }
+        Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        Write-Log "Processing volume: $($volume.DriveLetter) (VM: $($volume.VMName))"
+        $scanTargets = Get-ScanTargets -VolumeRoot $volume.DriveLetter
+        Write-Log "Scan targets: $($scanTargets.Count) path(s)"
+        $findings = Invoke-YARAScan -ScanPaths $scanTargets `
+                        -VolumeRoot $volume.DriveLetter -VMName $volume.VMName
+        if ($findings) {
+            Write-Log "⚠️  Found $($findings.Count) matches in $($volume.DriveLetter)" -Level "WARNING"
+        } else {
+            Write-Log "✓ No threats detected in $($volume.DriveLetter)"
+        }
+        # Emit findings for the parent to collect (works for ThreadJob, Job, and
+        # direct invocation alike).
+        $findings
+    }
+
+    # Build the positional argument array for one volume. -ArgumentList unrolls
+    # this into the worker's param() positionally; the same array is splatted
+    # (@wArgs) for direct sequential invocation.
+    function script:Get-WorkerArgs($v) {
+        return ,@($v, $fnTable, $YaraPath, $YaraRulesPath, $ScanTimeout, $QuickScan, $logFile)
+    }
+
+    $all = @()
+
+    switch ($script:ParallelMode) {
+        'ThreadJob' {
+            Write-Log "Scan mode: ThreadJob (in-process, throttle: $Throttle)"
+            $jobs = foreach ($v in $Volumes) {
+                $wArgs = Get-WorkerArgs $v
+                Start-ThreadJob -ScriptBlock $worker -ThrottleLimit $Throttle -ArgumentList $wArgs
+            }
+            $jobs | Wait-Job | Out-Null
+            $all = $jobs | Receive-Job
+            $jobs | Remove-Job -Force
+        }
+        'Job' {
+            Write-Log "Scan mode: Start-Job (out-of-process, throttle: $Throttle)"
+            $queue = [System.Collections.Queue]::new()
+            foreach ($v in $Volumes) { $queue.Enqueue($v) }
+            $running = @()
+            while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+                while ($running.Count -lt $Throttle -and $queue.Count -gt 0) {
+                    $v = $queue.Dequeue()
+                    $wArgs = Get-WorkerArgs $v
+                    $running += Start-Job -ScriptBlock $worker -ArgumentList $wArgs
+                }
+                $null = Wait-Job -Job $running -Any
+                $finished = @($running | Where-Object { $_.State -in 'Completed','Failed','Stopped' })
+                foreach ($f in $finished) {
+                    $all += Receive-Job $f
+                    Remove-Job $f -Force
+                }
+                $running = @($running | Where-Object { $_.State -eq 'Running' })
+            }
+        }
+        default {
+            Write-Log "Scan mode: Sequential (single-threaded fallback)"
+            foreach ($v in $Volumes) {
+                $wArgs = Get-WorkerArgs $v
+                $all += & $worker @wArgs
+            }
+        }
+    }
+
+    return @($all)
+}
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -455,58 +653,12 @@ try {
         exit 0
     }
     
-    $findingsBag = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
-
-    # Capture all functions and script-scope variables needed inside parallel threads
-    $fnInvokeYARAScan   = ${function:Invoke-YARAScan}.ToString()
-    $fnParseYARAOutput  = ${function:Parse-YARAOutput}.ToString()
-    $fnGetScanTargets   = ${function:Get-ScanTargets}.ToString()
-    $fnConvertPath      = ${function:Convert-ToWindowsPath}.ToString()
-    $fnWriteLog         = ${function:Write-Log}.ToString()
-
-    # Scan each mounted volume in parallel — one thread per volume.
-    # ThrottleLimit caps concurrent threads to CPU count so YARA I/O doesn't
-    # saturate the proxy's disk when many VMs are mounted simultaneously.
+    # Scan all mounted volumes using the best available parallelism tier
+    # (ThreadJob / Start-Job / Sequential — chosen at startup in $script:ParallelMode).
     $throttle = [Environment]::ProcessorCount
-    Write-Log "Starting parallel scan of $($volumes.Count) volume(s) (throttle: $throttle threads)"
+    Write-Log "Scanning $($volumes.Count) volume(s) (throttle: $throttle)"
 
-    $volumes | ForEach-Object -Parallel {
-        $volume = $_
-
-        # Re-define functions in this thread's scope
-        ${function:Write-Log}            = $using:fnWriteLog
-        ${function:Invoke-YARAScan}      = $using:fnInvokeYARAScan
-        ${function:Parse-YARAOutput}     = $using:fnParseYARAOutput
-        ${function:Get-ScanTargets}      = $using:fnGetScanTargets
-        ${function:Convert-ToWindowsPath}= $using:fnConvertPath
-
-        # Re-bind script-scope variables the functions reference
-        $script:LogMutex    = $using:script:LogMutex
-        $logFile            = $using:logFile
-        $YaraPath           = $using:YaraPath
-        $YaraRulesPath      = $using:YaraRulesPath
-        $ScanTimeout        = $using:ScanTimeout
-        $QuickScan          = $using:QuickScan
-        $bag                = $using:findingsBag
-
-        Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        Write-Log "Processing volume: $($volume.DriveLetter) (VM: $($volume.VMName))"
-
-        $scanTargets = Get-ScanTargets -VolumeRoot $volume.DriveLetter
-        Write-Log "Scan targets: $($scanTargets.Count) path(s)"
-
-        $findings = Invoke-YARAScan -ScanPaths $scanTargets `
-                        -VolumeRoot $volume.DriveLetter -VMName $volume.VMName
-
-        if ($findings) {
-            Write-Log "⚠️  Found $($findings.Count) matches in $($volume.DriveLetter)" -Level "WARNING"
-            foreach ($f in $findings) { $bag.Add($f) }
-        } else {
-            Write-Log "✓ No threats detected in $($volume.DriveLetter)"
-        }
-    } -ThrottleLimit $throttle
-
-    $allFindings = @($findingsBag)
+    $allFindings = @(Invoke-VolumeScans -Volumes $volumes -Throttle $throttle)
     
     # Display results
     Write-Log ""
