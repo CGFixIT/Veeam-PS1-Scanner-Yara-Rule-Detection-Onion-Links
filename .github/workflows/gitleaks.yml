@@ -35,15 +35,13 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_REPORT_FORMAT: sarif
-          GITLEAKS_REPORT_PATH: gitleaks-report.sarif
 
       # Upload SARIF to GitHub code scanning (Security > Code scanning)
       - name: Upload SARIF to code scanning
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: gitleaks-report.sarif
+          sarif_file: results.sarif
 
       # Fallback: also publish the SARIF as a build artifact
       - name: Upload SARIF as build artifact
@@ -51,5 +49,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gitleaks-sarif
-          path: gitleaks-report.sarif
+          path: results.sarif
           if-no-files-found: warn
