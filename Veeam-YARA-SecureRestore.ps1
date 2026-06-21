@@ -119,6 +119,7 @@ function Write-Log {
 
     <#
         Placeholder since that cmdlet doesnt exist yet (only relevant for unified veeam logging; otherwise the paths for this script log are defined
+        https://github.com/yetanothermightytool/powershell/blob/master/vbr/vbr-securerestore-lnx/vbr-securerestore.ps1 - not bad for workaround aside from just logging on server like it is now
     #>
     # Add-VBRJobLogEvent does not appear in Veeam v12/v13 public PS docs; the
     # -Type parameter name is unverified. Surface a one-time warning on failure
