@@ -19,6 +19,7 @@ A comprehensive malware detection system combining YARA rules with PowerShell au
 - [Deployment Guide](#deployment-guide)
 - [Output Examples](#output-examples)
 - [Feedback & Recommendations](#feedback--recommendations)
+- [Automated Tests](#automated-tests)
 - [Testing Recommendations](#testing-recommendations)
 - [Troubleshooting](#troubleshooting)
 - [Disclaimer](#disclaimer)
@@ -39,6 +40,17 @@ The native Windows scanner provides:
 - **Quick scan mode** - Target high-risk locations (ransomware hot spots)
 
 **PowerShell 5.1 is now the primary requirement.** PS7+ is used automatically when available for in-process parallel acceleration via `ThreadJob`/`Start-Job`, falling back to sequential mode on PS5.1-only systems. Two new YARA rules (`i2p_malware_indicator` and `freenet_darknet_indicator`) expand coverage beyond Tor. Optional `-SyslogServer` / `-VeeamOneServer` parameters enable RFC-5424 syslog and Veeam ONE REST API alerting on detection.
+
+### Reliability Hardening & Automated Test Suite
+
+The scanner now **degrades gracefully** instead of aborting when it hits common runtime failures:
+
+- If the log directory can't be created, it falls back to a temp path rather than failing the job before logging even starts.
+- Volume discovery survives an unhealthy Storage/CIM provider or an inaccessible mounted volume — it logs and continues instead of throwing.
+- A YARA process that fails to launch is reported as an error finding rather than crashing the scan loop.
+- The JSON report is still written even if the `yara --version` probe fails.
+
+These paths — and the rule set itself — are now covered by an automated **Pester + YARA test suite (58 tests)** under [`tests/`](tests/), runnable locally and in CI via [`.github/workflows/tests.yml`](.github/workflows/tests.yml). Two latent parsing/reporting bugs were found and fixed while adding the tests. See [Automated Tests](#automated-tests).
 
 ---
 
@@ -463,6 +475,7 @@ rule tor_c2_configuration {
 - **Operating System:** Windows Server 2016+ (for PowerShell scanner)
 - **PowerShell:** v5.1+ primary; v7+ used automatically when available for in-process parallel acceleration via ThreadJob
 - **Mount Servers:** Windows-based mount servers or SureBackup proxies
+- **Tested:** automated Pester + YARA suite on PowerShell 5.1 & 7 — see [Automated Tests](#automated-tests)
 
 **Note:** Comments using `//` in YARA rules may cause errors in some Veeam contexts - use `/* */` style if issues occur.
 
@@ -581,6 +594,48 @@ Invoke-RestMethod -Uri "https://splunk.company.com:8088/services/collector" `
                   -Headers @{"Authorization"="Splunk YOUR_HEC_TOKEN"} `
                   -Body ($jsonContent | ConvertTo-Json -Depth 10)
 ```
+
+---
+
+## Automated Tests
+
+A [Pester 5](https://pester.dev) + YARA suite under [`tests/`](tests/) validates both the PowerShell logic and the detection rules — **58 tests**, runnable on Windows PowerShell 5.1 and PowerShell 7.
+
+### Layout
+
+```
+tests/
+├── Invoke-Tests.ps1                 # runner (Pester config, NUnit output, exit code)
+├── Unit.PS1Logic.Tests.ps1          # unit tests for the scanner's PowerShell logic
+├── Integration.VeeamMock.Tests.ps1  # scanner driven against a mocked Veeam environment
+├── Yara.Detection.Tests.ps1         # fixture-based YARA detection tests (real engine)
+├── mocks/VeeamMock.psm1             # mock VBR 12.3.2 (PS 5.1) + VBR 13 (PS 7) cmdlets
+└── fixtures/                        # malicious (synthetic IOCs) + benign samples
+```
+
+### Running
+
+```powershell
+# Everything (auto-installs Pester if needed):
+pwsh -File tests/Invoke-Tests.ps1 -InstallPester
+
+# A single area:
+pwsh -Command "Invoke-Pester -Path ./tests/Yara.Detection.Tests.ps1 -Output Detailed"
+```
+
+The scanner is dot-sourced with `$env:VEEAM_YARA_NOEXEC=1` so its functions load for testing without launching a real scan.
+
+### What's covered
+
+- **PS1 logic** — `Parse-YARAOutput` (onion/string extraction, de-dup, metadata stripping, multi-rule & multi-file output, null safety), `Convert-ToWindowsPath`, `Get-ScanTargets` (quick vs full), `Export-ScanResults` (grouping + JSON envelope), `Write-Log`, and `Invoke-ProcessWithTimeout` (success / non-zero exit / timeout / launch failure).
+- **Mock Veeam environment** — `VeeamMock.psm1` models **VBR 12.3.2 paired with Windows PowerShell 5.1** (no `Add-VBRJobLogEvent` → file/host logging) and **VBR 13 paired with PowerShell 7** (`Add-VBRJobLogEvent` present → events forwarded). Tests cover volume-discovery filtering and hardening via a mocked `Get-Volume`, and the job-log integration path on both versions.
+- **YARA detection** — all six rules are checked against synthetic **malicious** fixtures (true positives) and **benign** fixtures that exercise the false-positive exclusion strings (true negatives), plus an end-to-end run through the scanner's own process runner + parser.
+
+> Detection fixtures use **synthetic, non-routable** indicators (fake `.onion` / `.i2p` / Freenet / Bitcoin strings) purely to validate the rules.
+
+### Continuous integration
+
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml) installs the `yara` CLI, runs the full suite on every push / PR that touches the scanner, the rules, or the tests, and uploads NUnit results. The YARA-engine tests self-skip if the `yara` binary is unavailable, so the suite still runs (reduced) without it.
 
 ---
 
